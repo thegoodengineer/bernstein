@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Callable, Iterator
     from contextlib import AbstractContextManager
     from pathlib import Path
 
@@ -96,14 +96,17 @@ class UncommittedIndex:
     * *Absent means scan.* A missing or unparseable index sends the caller
       to a full WAL scan that rebuilds it. Losing the file costs one slow
       boot, never a missed record.
-    * *Absent stays absent.* Only :meth:`rebuild` creates the file.
-      :meth:`add` is a no-op when it is gone, because an append-mode write
-      would resurrect it holding one row - short, well-formed, parseable,
-      and trusted, which is the one state a reader must never see.
+    * *Absent stays absent.* Only :meth:`rebuild` and
+      :meth:`rebuild_from_scan` create the file. :meth:`add` is a no-op when
+      it is gone, because an append-mode write would resurrect it holding one
+      row - short, well-formed, parseable, and trusted, which is the one
+      state a reader must never see.
     * *One writer at a time.* Every mutation and the read pair take a
       cross-process lock. ``add`` is a bare append while ``remove`` and
       ``rebuild`` are load-modify-save, so without one a lost update drops
-      a run from recovery entirely.
+      a run from recovery entirely. A rebuild that has to scan first holds
+      the lock across the scan too (:meth:`rebuild_from_scan`), because
+      ``add`` is a no-op for the whole of that window.
 
     All mutating operations ``fsync`` the file so a crash cannot leave
     the on-disk form diverging from the in-process state.
@@ -291,10 +294,57 @@ class UncommittedIndex:
     def rebuild(self, rows: list[tuple[str, int, str]]) -> None:
         """Replace the index with *rows* (used after a fallback scan).
 
-        The only operation that may create the file. See :meth:`add`.
+        One of the two operations that may create the file, the other being
+        :meth:`rebuild_from_scan`. See :meth:`add`.
+
+        Takes the lock, so a caller that already holds it must call
+        :meth:`_write_all` instead - a nested acquire deadlocks rather than
+        reentering, per :meth:`_locked`.
         """
         with self._locked():
             self._write_all(rows)
+
+    def rebuild_from_scan(
+        self,
+        scan: Callable[[], list[tuple[str, int, str]]],
+        *,
+        only_if_absent: bool,
+    ) -> bool:
+        """Run *scan* and publish its result, both under one lock.
+
+        The scan has to be inside the lock, not merely the write. While the
+        index is absent :meth:`add` is a no-op by design, so a row appended
+        between the scan reading a run's WAL and the rebuild landing is in
+        neither the scan result nor the index - and the index then exists, so
+        it is believed. That is one run's uncommitted entry never recovered,
+        from the same "absent or right" invariant :meth:`add` protects.
+
+        The window needs a second writer on one ``.sdd`` during the single
+        boot after an invalidate, which is narrow. It is closed rather than
+        documented because the cost of being wrong is a lost record.
+
+        The lock is therefore held across a full WAL walk, which is the slow
+        operation this class exists to avoid. That is bounded: it happens only
+        on a boot that finds no usable index, which was already the slow path.
+        A concurrent :meth:`add` that cannot wait it out raises
+        :class:`LockTimeout`, which its caller turns into an invalidate - one
+        more slow boot, never a missing row.
+
+        Args:
+            scan: Produces the rows to publish. Called at most once, inside
+                the lock. May walk the filesystem; nothing else may.
+            only_if_absent: When True, do nothing if the index already exists
+                (seeding a project that has none). When False, replace
+                whatever is there (rebuilding after an unusable read).
+
+        Returns:
+            True when the index was written.
+        """
+        with self._locked():
+            if only_if_absent and self._path.exists():
+                return False
+            self._write_all(scan())
+            return True
 
     def invalidate(self) -> bool:
         """Delete the index so the next scan falls back and rebuilds it.
@@ -365,12 +415,18 @@ class WALWriter:
         documented fallback: the next scan walks every WAL and rebuilds.
         """
         index = self._uncommitted_index()
-        if index.path.exists():
-            return
         wal_dir = self._sdd_dir / "runtime" / "wal"
-        try:
+
+        def scan() -> list[tuple[str, int, str]]:
             found = _uncommitted_in_runs(wal_dir, self._sdd_dir) if wal_dir.is_dir() else []
-            index.rebuild([(run_id, entry.seq, entry.entry_hash) for run_id, entry in found])
+            return [(run_id, entry.seq, entry.entry_hash) for run_id, entry in found]
+
+        try:
+            # The existence check, the scan and the write are one locked
+            # operation: while the index is absent ``add`` is a no-op, so a
+            # row appended mid-scan would land nowhere and then be believed
+            # missing. See UncommittedIndex.rebuild_from_scan.
+            index.rebuild_from_scan(scan, only_if_absent=True)
         except (OSError, ValueError, LockTimeout):
             # ValueError covers UnicodeDecodeError: the reader opens as UTF-8
             # and a torn write mid-multibyte is exactly what crash recovery
@@ -1024,8 +1080,11 @@ class WALRecovery:
         else:
             # Missing or unparseable index: one slow boot, then rebuild it
             # from what the scan found so the next boot takes the fast path.
-            found = _uncommitted_in_runs(wal_dir, sdd_dir)
-            WALRecovery._rebuild_index(index, found)
+            # The scan runs inside the index lock for the same reason the
+            # seed's does - ``add`` is a no-op while the index is unusable,
+            # so a row appended mid-scan would be in neither the result nor
+            # the index that replaces it.
+            found = WALRecovery._scan_and_rebuild_index(index, wal_dir, sdd_dir)
         # ``exclude_run_id`` is filtered last, not during the walk: the
         # current run's own uncommitted entries belong in the index, so a
         # rebuild that skipped them would write a short one.
@@ -1054,12 +1113,37 @@ class WALRecovery:
         return {run_id for run_id, _seq, _entry_hash in rows}
 
     @staticmethod
-    def _rebuild_index(index: UncommittedIndex, found: list[tuple[str, WALEntry]]) -> None:
-        """Write *found* back to the index. Best-effort: a failure costs a scan."""
+    def _scan_and_rebuild_index(
+        index: UncommittedIndex,
+        wal_dir: Path,
+        sdd_dir: Path,
+    ) -> list[tuple[str, WALEntry]]:
+        """Walk every WAL under the index lock and publish the result.
+
+        Returns what the scan found, which the caller still needs - the point
+        of the lock is only that no append can slip between the walk and the
+        write that makes its result authoritative.
+
+        Best-effort on the write: a failure leaves the index absent or stale,
+        which costs another scan and never a record. The scan result is
+        returned either way, so recovery proceeds on this boot regardless.
+        """
+        found: list[tuple[str, WALEntry]] = []
+
+        def scan() -> list[tuple[str, int, str]]:
+            nonlocal found
+            found = _uncommitted_in_runs(wal_dir, sdd_dir)
+            return [(run_id, entry.seq, entry.entry_hash) for run_id, entry in found]
+
         try:
-            index.rebuild([(run_id, entry.seq, entry.entry_hash) for run_id, entry in found])
-        except OSError:
+            index.rebuild_from_scan(scan, only_if_absent=False)
+        except (OSError, LockTimeout):
             logger.warning("could not rebuild the uncommitted index at %s", index.path, exc_info=True)
+            if not found:
+                # The scan never ran (the lock was not granted), so fall back
+                # to an unindexed walk rather than reporting nothing.
+                found = _uncommitted_in_runs(wal_dir, sdd_dir)
+        return found
 
     @staticmethod
     def find_orphaned_claims(

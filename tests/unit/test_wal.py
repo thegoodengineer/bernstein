@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
+import threading
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -1215,3 +1217,179 @@ class TestFingerprintDivergence:
         d = WALEntryDigest(seq=0, decision_type="x", digest="a" * 64)
         with pytest.raises((AttributeError, TypeError)):
             d.seq = 1  # type: ignore[misc]
+
+
+class TestUncommittedIndexLocking:
+    """The lock is what makes load-modify-save safe against a bare append.
+
+    ``add`` appends. ``remove`` / ``remove_run`` / ``rebuild`` load, filter and
+    write the whole file back. Interleave them without a lock and the
+    write-back is computed from rows that predate the append, so the appended
+    row is silently dropped.
+
+    That cost nothing while recovery read every WAL - the row was a hint. It
+    costs a record now: an index that exists is authoritative, so a run missing
+    from it never has its WAL opened, and its uncommitted ``task_claimed`` is
+    never failed.
+
+    Both writers here are separate ``UncommittedIndex`` handles, which is what
+    two orchestrators on one ``.sdd`` are. ``flock`` and ``msvcrt.locking`` are
+    both per-descriptor, so two handles contend even inside one process.
+    """
+
+    @staticmethod
+    def _park_write_all(monkeypatch: pytest.MonkeyPatch) -> tuple[threading.Event, threading.Event]:
+        """Hold every ``_write_all`` open until told to proceed.
+
+        This is the load-modify-save window, widened until it is reliable to
+        interleave with. The window exists on every call; the test only makes
+        it long enough to aim at.
+
+        Returns ``(entered, release)``. ``entered`` is set from inside the
+        patched method, so a caller waits on the writer actually being parked
+        rather than on a sleep that assumes it.
+        """
+        entered = threading.Event()
+        release = threading.Event()
+        real_write_all = UncommittedIndex._write_all
+
+        def blocking_write_all(self: UncommittedIndex, rows: list[tuple[str, int, str]]) -> None:
+            entered.set()
+            release.wait(timeout=10)
+            real_write_all(self, rows)
+
+        monkeypatch.setattr(UncommittedIndex, "_write_all", blocking_write_all)
+        return entered, release
+
+    def _interleave_append_into_a_removal(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> bool:
+        """Append to the index while a removal is parked mid write-back.
+
+        Returns whether ``add`` reported success. The removal is started in a
+        thread and blocked inside ``_write_all`` - it has loaded its rows and,
+        when the lock is in place, still holds it.
+        """
+        entered, release = self._park_write_all(monkeypatch)
+        remover = threading.Thread(target=lambda: UncommittedIndex(tmp_path).remove("stranded", 7))
+        remover.start()
+        # Released from a timer, not after the append: with the lock in place
+        # the append *blocks* on the removal, so releasing afterwards would
+        # deadlock the test against the very mechanism it is checking. The
+        # delay only has to outlast the append's attempt to acquire, and it
+        # is far inside the index's own 5s lock timeout.
+        unparker = threading.Timer(0.2, release.set)
+        unparker.start()
+        try:
+            assert entered.wait(timeout=10), "the removal never reached its write-back"
+            return UncommittedIndex(tmp_path).add("live", 1, "b" * 64)
+        finally:
+            unparker.cancel()
+            release.set()
+            remover.join(timeout=10)
+
+    def test_an_append_during_a_removal_is_not_lost(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The assertion that goes red the moment ``_locked`` stops locking.
+
+        Replace ``_locked`` with ``nullcontext`` and ``remove`` writes back the
+        rows it loaded before the append, dropping ``live`` - the run whose WAL
+        recovery would then never open.
+        """
+        UncommittedIndex(tmp_path).rebuild([("stranded", 7, "a" * 64), ("keep", 1, "c" * 64)])
+
+        appended = self._interleave_append_into_a_removal(tmp_path, monkeypatch)
+
+        assert appended, "the append itself failed, so this proves nothing about the lock"
+        rows = UncommittedIndex(tmp_path).load()
+        assert ("live", 1, "b" * 64) in rows, "the appended row was overwritten by the removal's write-back"
+        assert ("stranded", 7, "a" * 64) not in rows, "the removal did not take effect"
+        assert ("keep", 1, "c" * 64) in rows
+
+    def test_the_lock_is_what_holds_it_together(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The same interleaving with the lock removed, asserted to lose the row.
+
+        Without this, the test above would keep passing if the lock were
+        deleted *and* the timing happened to stop overlapping - green for the
+        wrong reason. Here the loss is the expected result, so the pair
+        separates "the lock works" from "the threads did not race".
+        """
+        monkeypatch.setattr(UncommittedIndex, "_locked", lambda _self: contextlib.nullcontext())
+        UncommittedIndex(tmp_path).rebuild([("stranded", 7, "a" * 64)])
+
+        self._interleave_append_into_a_removal(tmp_path, monkeypatch)
+
+        assert ("live", 1, "b" * 64) not in UncommittedIndex(tmp_path).load()
+
+    def test_a_row_missing_from_the_index_costs_a_recovered_record(self, tmp_path: Path) -> None:
+        """Why the dropped row matters, at the level the fast path acts on.
+
+        A run absent from an index that exists is a run whose WAL is never
+        opened, so its uncommitted entry is not in ``scan_all_uncommitted``.
+        This is the consequence the two tests above exist to prevent, and it
+        is what makes a lost update cost a record rather than a WAL read.
+        """
+        writer = WALWriter(run_id="live", sdd_dir=tmp_path)
+        writer.append("task_claimed", {"task_id": "t-1"}, {}, "actor", committed=False)
+
+        index = UncommittedIndex(tmp_path)
+        rows = index.load()
+        assert any(r[0] == "live" for r in rows), "precondition: the writer indexed its uncommitted entry"
+        assert WALRecovery.scan_all_uncommitted(tmp_path, exclude_run_id="other")
+
+        # Exactly what a lost update leaves behind: a well-formed index that
+        # simply does not name this run.
+        index.rebuild([r for r in rows if r[0] != "live"])
+
+        assert WALRecovery.scan_all_uncommitted(tmp_path, exclude_run_id="other") == []
+
+    def test_an_append_during_a_seeding_scan_is_not_lost(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The seed's scan has to be inside the lock, not just its write.
+
+        While the index is absent ``add`` is a no-op by design, so a row
+        appended between the scan reading a run's WAL and the rebuild landing
+        would be in neither - and the index then exists, so it is believed.
+
+        Here the scan is parked mid-walk and a second handle appends. With the
+        lock around the whole operation the append waits and its row survives;
+        with the lock around the write alone it lands in the gap and the
+        rebuild publishes an index that does not name it.
+        """
+        writer = WALWriter(run_id="early", sdd_dir=tmp_path)
+        writer.append("task_claimed", {"task_id": "t-0"}, {}, "actor", committed=False)
+        index = UncommittedIndex(tmp_path)
+        assert index.invalidate(), "precondition: the seed only runs when the index is absent"
+
+        entered, release = self._park_write_all(monkeypatch)
+        unparker = threading.Timer(0.2, release.set)
+        unparker.start()
+        seeder = threading.Thread(target=lambda: WALWriter(run_id="seeder", sdd_dir=tmp_path))
+        seeder.start()
+        try:
+            assert entered.wait(timeout=10), "the seed never reached its write"
+            # add() is a no-op while the index is absent, so this is the
+            # rebuild's own row set that has to include the appended entry.
+            UncommittedIndex(tmp_path).add("late", 1, "d" * 64)
+        finally:
+            unparker.cancel()
+            release.set()
+            seeder.join(timeout=10)
+
+        assert any(r[0] == "early" for r in UncommittedIndex(tmp_path).load())
+        assert WALRecovery.scan_all_uncommitted(tmp_path, exclude_run_id="other")
+
+    def test_the_seed_does_not_overwrite_an_index_that_already_exists(self, tmp_path: Path) -> None:
+        """``only_if_absent`` is checked under the lock, not before taking it."""
+        index = UncommittedIndex(tmp_path)
+        index.rebuild([("kept", 3, "e" * 64)])
+
+        def scan() -> list[tuple[str, int, str]]:  # pragma: no cover - must not run
+            raise AssertionError("scanned an index that already existed")
+
+        assert index.rebuild_from_scan(scan, only_if_absent=True) is False
+        assert index.load() == [("kept", 3, "e" * 64)]
+
+    def test_a_rebuild_from_scan_replaces_an_unusable_index(self, tmp_path: Path) -> None:
+        """The fallback path: whatever is there is replaced by the scan."""
+        index = UncommittedIndex(tmp_path)
+        index.path.write_text("{ not json\n")
+
+        assert index.rebuild_from_scan(lambda: [("fresh", 1, "f" * 64)], only_if_absent=False) is True
+        assert index.load() == [("fresh", 1, "f" * 64)]
